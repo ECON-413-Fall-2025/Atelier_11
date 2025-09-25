@@ -1,0 +1,390 @@
+# ---------------------- install missing packages ---------------------------
+pkgs <- c(
+  "shiny","BVAR","dplyr","tidyr","zoo","stringr","purrr",
+  "ggplot2","tibble","scales","sandwich","lmtest","MSwM"
+)
+new <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
+
+# ---------------------------- libraries ------------------------------------
+suppressPackageStartupMessages({
+  library(shiny)
+  library(BVAR)       # fred_qd, fred_transform
+  library(dplyr); library(tidyr); library(zoo); library(stringr); library(purrr)
+  library(ggplot2); library(tibble); library(scales)
+  library(sandwich); library(lmtest); library(MSwM)
+})
+
+# ------------------------ helpers (outside Shiny) --------------------------
+zscore <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(x*0)
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+lag_mat_df <- function(df, p, prefix) {
+  if (p <= 0) return(tibble())
+  out <- list()
+  for (nm in names(df)) for (L in 1:p)
+    out[[paste0(prefix, "_", nm, "_L", L)]] <- dplyr::lag(df[[nm]], L)
+  as_tibble(out)
+}
+
+# Robust quarter parser for fred_qd rownames (handles YYYYQ#, YYYY-Q#, dates)
+to_yearqtr_robust <- function(stamp) {
+  s <- as.character(stamp)
+  try_fmt <- function(fmt) suppressWarnings(zoo::as.yearqtr(s, format = fmt))
+  try_date <- function(fmt = NULL) {
+    if (is.null(fmt)) suppressWarnings(as.Date(s)) else suppressWarnings(as.Date(s, format = fmt))
+  }
+  candidates <- list(
+    try_fmt("%YQ%q"),
+    try_fmt("%Y-Q%q"),
+    try_fmt("%Y Q%q"),
+    try_fmt("Q%q %Y")
+  )
+  d_iso <- try_date("%Y-%m-%d")
+  d_num <- try_date("%Y%m%d")
+  d_any <- try_date()
+  candidates <- c(
+    candidates,
+    list(ifelse(is.na(d_iso), NA, zoo::as.yearqtr(d_iso))),
+    list(ifelse(is.na(d_num), NA, zoo::as.yearqtr(d_num))),
+    list(ifelse(is.na(d_any), NA, zoo::as.yearqtr(d_any)))
+  )
+  nn <- vapply(candidates, function(x) sum(!is.na(x)), integer(1))
+  candidates[[which.max(nn)]]
+}
+
+# Jordà LP with Newey–West and horizon clamping (base building block)
+lp_irf <- function(y, x, ctrls, H = 40, p = 4) {
+  N <- length(y); if (N <= p) stop("Not enough data after lags.")
+  H_eff <- max(0, min(H, N - p - 1))
+  
+  base <- tibble(y = as.numeric(y), x = as.numeric(x))
+  y_lags <- lag_mat_df(tibble(y = base$y), p, "y")
+  x_lags <- lag_mat_df(tibble(x = base$x), p, "x")
+  c_lags <- if (ncol(ctrls) > 0) lag_mat_df(ctrls, p, "c") else tibble()
+  
+  df_full <- bind_cols(base, y_lags, x_lags, c_lags)
+  
+  est_one_h <- function(h) {
+    d <- df_full %>% mutate(y_lead = dplyr::lead(y, h)) %>% tidyr::drop_na()
+    if (nrow(d) == 0) return(c(h=h, beta=NA_real_, se=NA_real_))
+    rhs <- c("x", names(y_lags), names(x_lags), names(c_lags))
+    fit <- lm(as.formula(paste("y_lead ~", paste(rhs, collapse=" + "))), data=d)
+    Vnw <- sandwich::NeweyWest(fit, lag = max(0, min(h + p, nrow(d)-1)), prewhite=FALSE, adjust=TRUE)
+    bh <- coef(fit)["x"]; se <- sqrt(diag(Vnw))["x"]
+    c(h=h, beta=unname(bh), se=unname(se))
+  }
+  
+  map_dfr(0:H_eff, ~as.list(est_one_h(.x))) %>%
+    mutate(lower = beta - 1.96*se, upper = beta + 1.96*se)
+}
+
+# State-/weight-dependent LP: two IRFs from interactions with weight W in [0,1]
+# (W = 1 for "recession", 0 for "expansion"; can be continuous for smooth transition)
+lp_irf_two <- function(y, x, W, ctrls, H = 40, p = 4) {
+  N <- length(y); if (N <= p) stop("Not enough data after lags.")
+  H_eff <- max(0, min(H, N - p - 1))
+  
+  base <- tibble(y = as.numeric(y), x = as.numeric(x), W = as.numeric(W))
+  base <- base %>% mutate(x_rec = x*W, x_exp = x*(1-W))
+  y_lags <- lag_mat_df(tibble(y = base$y), p, "y")
+  x_lags <- lag_mat_df(tibble(x = base$x), p, "x")
+  c_lags <- if (ncol(ctrls) > 0) lag_mat_df(ctrls, p, "c") else tibble()
+  df_full <- bind_cols(base, y_lags, x_lags, c_lags)
+  
+  est_one_h <- function(h) {
+    d <- df_full %>% mutate(y_lead = dplyr::lead(y, h)) %>% tidyr::drop_na()
+    if (nrow(d) == 0)
+      return(c(h=h, b_rec=NA_real_, se_rec=NA_real_, b_exp=NA_real_, se_exp=NA_real_))
+    rhs <- c("x_rec","x_exp", names(y_lags), names(x_lags), names(c_lags), "W")
+    fit <- lm(as.formula(paste("y_lead ~", paste(rhs, collapse=" + "))), data=d)
+    Vnw <- sandwich::NeweyWest(fit, lag = max(0, min(h + p, nrow(d)-1)), prewhite=FALSE, adjust=TRUE)
+    br <- coef(fit)["x_rec"]; sr <- sqrt(diag(Vnw))["x_rec"]
+    be <- coef(fit)["x_exp"]; se <- sqrt(diag(Vnw))["x_exp"]
+    c(h=h, b_rec=unname(br), se_rec=unname(sr), b_exp=unname(be), se_exp=unname(se))
+  }
+  
+  map_dfr(0:H_eff, ~as.list(est_one_h(.x))) %>%
+    mutate(lower_rec = b_rec - 1.96*se_rec, upper_rec = b_rec + 1.96*se_rec,
+           lower_exp = b_exp - 1.96*se_exp, upper_exp = b_exp + 1.96*se_exp)
+}
+
+# Build regime weights W_t
+# method = "mswm": latent 2-state via MSwM on driver (AR(1)), W = 1{p_rec > thr}
+# method = "smooth": logistic g(z) = 1/(1+exp(-gamma*(z - c))) on standardized driver
+build_weights <- function(method, df_panel, driver_name, thr = 0.5, gamma = 10, cutoff = 0) {
+  stopifnot(driver_name %in% names(df_panel))
+  drv <- df_panel[[driver_name]]
+  
+  if (method == "mswm") {
+    d <- tibble(drv = drv, L1 = dplyr::lag(drv,1))
+    valid <- stats::complete.cases(d$drv, d$L1)
+    validate_msg <- "MSwM failed to converge; try another driver or adjust settings."
+    if (sum(valid) < 10) stop("Not enough observations for MSwM.")
+    
+    # Plain AR(1); switching intercept & slope
+    fit <- try(
+      MSwM::msmFit(stats::lm(drv ~ L1, data = d[valid, ]), k = 2, sw = c(TRUE, TRUE)),
+      silent = TRUE
+    )
+    if (inherits(fit, "try-error")) stop(validate_msg)
+    
+    p <- fit@Fit@smoProb   # matrix: T_valid x 2
+    # Label the "recession" state as the one with lower mean driver when prob>0.5
+    means <- sapply(1:2, function(j) mean(d$drv[valid][p[, j] > 0.5], na.rm = TRUE))
+    rec_state <- which.min(means)
+    pr_full <- rep(NA_real_, nrow(d))
+    pr_full[valid] <- p[, rec_state]
+    W <- as.numeric(pr_full > thr)
+    return(W)
+    
+  } else { # "smooth"
+    dz <- zscore(drv)
+    W <- 1/(1 + exp(-gamma * (dz - cutoff)))
+    return(W)
+  }
+}
+
+# -------------------- DATA: transform BEFORE Shiny starts -------------------
+# 1) Load the BVAR-provided FRED-QD panel (dates in rownames)
+fq_raw <- BVAR::fred_qd
+
+# 2) Apply official FRED-QD appendix transforms to ALL series up front
+fq_tr  <- BVAR::fred_transform(fq_raw, type = "fred_qd", na.rm = FALSE)
+
+# 3) Convert rownames to a robust yearqtr index and build tibble
+fq <- fq_tr %>%
+  tibble::as_tibble(rownames = ".stamp") %>%
+  dplyr::mutate(.qtr = to_yearqtr_robust(.stamp)) %>%
+  dplyr::select(-.stamp) %>%
+  dplyr::relocate(.qtr) %>%
+  dplyr::arrange(.qtr)
+
+if (all(is.na(fq$.qtr))) {
+  stop("Could not parse fred_qd rownames into quarters.")
+}
+
+# Variable universe
+FQ_CODES <- sort(setdiff(names(fq), ".qtr"))
+
+# Shock menu (four choices; show only those present)
+SHOCK_CHOICES_ALL <- c("BAA10YM","TNWMVBSNNCBBDIx","CONSPIx","UMCSENTx")
+SHOCK_CHOICES <- intersect(SHOCK_CHOICES_ALL, FQ_CODES)
+SHOCK_LABELS  <- c(
+  BAA10YM = "BAA10YM (BAA − 10Y Treasury spread)",
+  TNWMVBSNNCBBDIx = "TNWMVBSNNCBBDIx (NFC net worth / disp. business income)",
+  CONSPIx = "CONSPIx (nonrevolving consumer loans / personal income)",
+  UMCSENTx = "UMCSENTx (sentiment index)"
+)
+SHOCK_DISPLAY <- SHOCK_LABELS[SHOCK_CHOICES]
+names(SHOCK_CHOICES) <- SHOCK_DISPLAY
+
+# Controls (omit any that equals Y)
+CONTROL_SET <- c("GDPC1","INDPRO","PCECTPI","FEDFUNDS")
+
+# --------------------------------- UI --------------------------------------
+ui <- fluidPage(
+  tags$head(tags$title("Atelier: State‑Dependent Local Projections • ECON 413")),
+  titlePanel("Local Projections with Markov‑Switching or Smooth‑Transition Regimes"),
+  fluidRow(
+    column(
+      4,
+      wellPanel(
+        selectInput("shock", "Shock variable:", choices = SHOCK_CHOICES),
+        selectInput("yvar",  "Endogenous variable (Y):", choices = FQ_CODES, selected = "INDPRO"),
+        numericInput("lags", "Number of lags p:", value = 4, min = 1, max = 12, step = 1),
+        numericInput("horizon", "IRF horizon H (quarters):", value = 40, min = 4, max = 60, step = 1),
+        checkboxInput("zscale", "Scale shock & Y to SD units", TRUE),
+        radioButtons(
+          "regime_method", "Regime method:",
+          choices = c("Markov‑switching (MSwM)" = "mswm",
+                      "Smooth‑transition (logistic)" = "smooth"),
+          selected = "mswm"
+        ),
+        conditionalPanel(
+          "input.regime_method == 'mswm'",
+          selectInput("ms_driver", "MSwM driver (transformed series):",
+                      choices = FQ_CODES, selected = "INDPRO"),
+          sliderInput("ms_thr", "Recession prob. threshold (τ):",
+                      min = 0.1, max = 0.9, value = 0.5, step = 0.05)
+        ),
+        conditionalPanel(
+          "input.regime_method == 'smooth'",
+          selectInput("sm_driver", "Smooth driver (transformed series):",
+                      choices = FQ_CODES, selected = "INDPRO"),
+          sliderInput("sm_gamma", "Logistic slope γ (steepness):",
+                      min = 1, max = 25, value = 10, step = 1),
+          numericInput("sm_cut", "Logistic cutoff c (in SD units of driver):",
+                       value = 0, step = 0.1)
+        ),
+        actionButton("go", "Estimate IRFs", class = "btn-primary")
+      ),
+      helpText(HTML(
+        "<b>All variables transformed before session</b> via <code>BVAR::fred_transform()</code>. ",
+        "Controls: GDPC1, INDPRO, PCECTPI, FEDFUNDS (omit if equal to Y). ",
+        "LPs: Jord\u00E0 projections with Newey–West SEs. ",
+        "<br><b>MSwM:</b> 2-state AR(1) on driver, recession = lower-mean state; threshold τ binarizes. ",
+        "<br><b>Smooth:</b> logistic weight g(z) on standardized driver (γ, c chosen below)."
+      ))
+    ),
+    column(
+      8,
+      plotOutput("irfPlot", height = "480px"),
+      br(),
+      textOutput("sampleInfo"),
+      textOutput("specInfo")
+    )
+  )
+)
+
+# -------------------------------- Server -----------------------------------
+server <- function(input, output, session){
+  
+  merged_data <- eventReactive(input$go, {
+    yvar      <- input$yvar
+    shock_var <- input$shock
+    H_req <- input$horizon
+    p     <- input$lags
+    method <- input$regime_method
+    
+    validate(need(length(SHOCK_CHOICES) > 0,
+                  "Required shock series are not present in this fred_qd build."))
+    validate(need(all(c(yvar, shock_var) %in% names(fq)), "Selected series not found in fred_qd."))
+    
+    ctrls <- setdiff(CONTROL_SET, yvar)
+    validate(need(all(ctrls %in% names(fq)),
+                  paste0("Missing required controls in this fred_qd build: ",
+                         paste(setdiff(CONTROL_SET, names(fq)), collapse = ", "))))
+    
+    # Build model frame (also include driver for regime construction)
+    driver_name <- if (method == "mswm") input$ms_driver else input$sm_driver
+    validate(need(driver_name %in% names(fq), "Chosen driver not found in fred_qd."))
+    
+    df <- fq %>%
+      dplyr::mutate(
+        y     = .data[[yvar]],
+        shock = .data[[shock_var]],
+        drv   = .data[[driver_name]]
+      ) %>%
+      dplyr::select(.qtr, y, shock, drv, tidyselect::all_of(ctrls)) %>%
+      tidyr::drop_na()
+    
+    N <- nrow(df)
+    validate(need(N > p + 1,
+                  paste0("Only N = ", N, " usable quarters after transforms/intersection; with p = ", p,
+                         " need at least ", p + 2, " for h = 0. Try a different Y, shock, or driver.")))
+    
+    # Standardize Y and shock for comparability (controls stay in transformed units)
+    if (isTRUE(input$zscale)) {
+      df <- df %>% dplyr::mutate(y = zscore(y), shock = zscore(shock))
+    }
+    
+    # Build weights W_t
+    W <- if (method == "mswm") {
+      build_weights("mswm", df_panel = df, driver_name = "drv", thr = input$ms_thr)
+    } else {
+      build_weights("smooth", df_panel = df, driver_name = "drv",
+                    gamma = input$sm_gamma, cutoff = input$sm_cut)
+    }
+    
+    df <- df %>% dplyr::mutate(W = W) %>% tidyr::drop_na()
+    
+    N2 <- nrow(df)
+    validate(need(N2 > p + 1,
+                  paste0("Only N = ", N2, " usable quarters after regime construction; with p = ", p,
+                         " need at least ", p + 2, " for h = 0. Adjust driver/threshold or p.")))
+    
+    H_eff <- max(0, min(H_req, N2 - p - 1))
+    
+    list(
+      df = df, yvar = yvar, shock_var = shock_var, ctrls = ctrls,
+      H_req = H_req, H_eff = H_eff, p = p,
+      shock_label = names(SHOCK_CHOICES)[match(shock_var, SHOCK_CHOICES)],
+      method = method, driver_name = driver_name
+    )
+  }, ignoreInit = TRUE)
+  
+  irf_tbl <- reactive({
+    m <- merged_data(); d <- m$df
+    ctrl_mat <- as_tibble(d[, m$ctrls, drop = FALSE])
+    lp_irf_two(
+      y = d$y, x = d$shock, W = d$W,
+      ctrls = ctrl_mat, H = m$H_eff, p = m$p
+    ) %>% as_tibble()
+  })
+  
+  to_long_irf <- function(irf){
+    bind_rows(
+      transmute(irf, h, beta = b_rec,  lower = lower_rec, upper = upper_rec,
+                regime = "High recession weight"),
+      transmute(irf, h, beta = b_exp,  lower = lower_exp, upper = upper_exp,
+                regime = "Low recession weight")
+    )
+  }
+  
+  output$irfPlot <- renderPlot({
+    req(irf_tbl())
+    m <- merged_data()
+    irf_long <- to_long_irf(irf_tbl())
+    
+    sm_note <- if (m$method == "smooth") {
+      paste0("Smooth transition on ", m$driver_name,
+             " with g(z)=1/(1+exp(-γ(z-c)))",
+             " • γ=", input$sm_gamma, ", c=", input$sm_cut)
+    } else {
+      paste0("Markov-switching on ", m$driver_name, " (τ=", input$ms_thr, ")")
+    }
+    
+    ggplot(irf_long, aes(x = h, y = beta, color = regime, fill = regime)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+      geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.18, color = NA) +
+      geom_line(linewidth = 1.2) +
+      labs(
+        x = "Horizon (quarters)",
+        y = "Response (SD units of Y)",
+        color = NULL, fill = NULL,
+        title = paste0("State-Dependent LP IRFs of ", m$yvar, " to ", m$shock_label),
+        subtitle = paste0(
+          sm_note, " • Controls: ", paste(m$ctrls, collapse = ", "),
+          " • p = ", m$p, " • H (effective) = ", m$H_eff
+        )
+      ) +
+      scale_x_continuous(breaks = seq(0, max(irf_long$h, na.rm = TRUE), by = 4),
+                         limits = c(0, max(irf_long$h, na.rm = TRUE))) +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(face = "bold"),
+            panel.grid.minor = element_blank(),
+            legend.position = "bottom")
+  })
+  
+  
+  output$sampleInfo <- renderText({
+    m <- merged_data(); d <- m$df
+    rng <- paste(format(min(d$.qtr)), "to", format(max(d$.qtr)))
+    paste0("Sample after pre‑session transforms, intersection, and regime build: ",
+           rng, " • N = ", nrow(d), " quarters.")
+  })
+  
+  output$specInfo <- renderText({
+    m <- merged_data()
+    paste0(
+      "Controls (transformed, p‑lagged): ", paste(m$ctrls, collapse = ", "),
+      " • lags p = ", m$p,
+      " • requested H = ", m$H_req,
+      " • effective H = ", m$H_eff
+    )
+  })
+}
+
+shinyApp(ui, server)
+
+#----------------------------------TO DO----------------------------------------
+# 1. This applet shows you how impulse response functions differ whether the economy
+#    is in a recession or not. Jorda, Schularick, and Taylor (2011) suggest recessions
+#    accompanied by credit crunches are "deeper and longer" than those not accompanied
+#    by credit frictions. Why do you think that might be?
+# 2. Use the impulse response differences here to test the hypothesis. There is no
+#    single correct answer. Defend your position as you will with the evidence at hand.
