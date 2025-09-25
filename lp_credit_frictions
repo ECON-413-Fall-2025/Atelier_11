@@ -1,0 +1,311 @@
+# ---------------------- install missing packages ---------------------------
+pkgs <- c(
+  "shiny","BVAR","dplyr","tidyr","zoo","stringr","purrr",
+  "ggplot2","tibble","scales","sandwich","lmtest"
+)
+new <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
+
+# ---------------------------- libraries ------------------------------------
+suppressPackageStartupMessages({
+  library(shiny)
+  library(BVAR)       # fred_qd, fred_transform
+  library(dplyr); library(tidyr); library(zoo); library(stringr); library(purrr)
+  library(ggplot2); library(tibble); library(scales)
+  library(sandwich); library(lmtest)
+})
+
+# ------------------------ helpers (outside Shiny) --------------------------
+zscore <- function(x) { (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE) }
+
+lag_mat_df <- function(df, p, prefix) {
+  if (p <= 0) return(tibble())
+  out <- list()
+  for (nm in names(df)) for (L in 1:p)
+    out[[paste0(prefix, "_", nm, "_L", L)]] <- dplyr::lag(df[[nm]], L)
+  as_tibble(out)
+}
+
+lp_irf <- function(y, x, ctrls, H = 40, p = 4) {
+  N <- length(y)
+  if (N <= p) stop("Not enough observations after lags; try reducing p or choosing series with more overlap.")
+  
+  # Maximum feasible horizon given N and p
+  H_eff <- max(0, min(H, N - p - 1))
+  
+  base <- tibble::tibble(y = as.numeric(y), x = as.numeric(x))
+  y_lags <- lag_mat_df(tibble::tibble(y = base$y), p, "y")
+  x_lags <- lag_mat_df(tibble::tibble(x = base$x), p, "x")
+  c_lags <- if (ncol(ctrls) > 0) lag_mat_df(ctrls, p, "c") else tibble::tibble()
+  
+  df_full <- dplyr::bind_cols(base, y_lags, x_lags, c_lags)
+  
+  est_one_h <- function(h) {
+    d <- df_full %>%
+      dplyr::mutate(y_lead = dplyr::lead(y, h)) %>%
+      tidyr::drop_na()
+    
+    if (nrow(d) == 0) {
+      return(c(h = h, beta = NA_real_, se = NA_real_))
+    }
+    
+    rhs_terms <- c("x", names(y_lags), names(x_lags), names(c_lags))
+    fit <- stats::lm(stats::as.formula(paste("y_lead ~", paste(rhs_terms, collapse = " + "))), data = d)
+    
+    # NW lag cannot exceed sample - 1
+    lag_nw <- max(0, min(h + p, nrow(d) - 1))
+    Vnw <- sandwich::NeweyWest(fit, lag = lag_nw, prewhite = FALSE, adjust = TRUE)
+    
+    bhat <- stats::coef(fit)["x"]
+    se   <- sqrt(diag(Vnw))["x"]
+    c(h = h, beta = unname(bhat), se = unname(se))
+  }
+  
+  irf <- purrr::map_dfr(0:H_eff, ~as.list(est_one_h(.x))) %>%
+    dplyr::mutate(lower = beta - 1.96 * se,
+                  upper = beta + 1.96 * se)
+  
+  irf
+}
+
+
+to_yearqtr_any <- function(ix_chr) {
+  ix <- toupper(ix_chr)
+  ix <- gsub("[[:space:]:-]", "", ix)   # remove spaces, colons, dashes
+  # Expect "YYYYQ#" after cleanup
+  zoo::as.yearqtr(ix, format = "%YQ%q")
+}
+
+# -------------------- DATA: transform BEFORE Shiny starts -------------------
+# 1) Load the BVAR-provided FRED-QD panel (dates live in rownames)
+fq_raw <- BVAR::fred_qd
+
+# 2) Apply official FRED-QD appendix transforms to ALL series up front
+fq_tr  <- BVAR::fred_transform(fq_raw, type = "fred_qd", na.rm = FALSE)
+
+# 3) Convert rownames to a robust yearqtr index
+to_yearqtr_robust <- function(stamp) {
+  s <- as.character(stamp)
+  
+  best <- rep(NA_real_, length(s))
+  
+  try_fmt <- function(fmt) suppressWarnings(zoo::as.yearqtr(s, format = fmt))
+  try_date <- function(fmt = NULL) {
+    if (is.null(fmt)) suppressWarnings(as.Date(s))
+    else suppressWarnings(as.Date(s, format = fmt))
+  }
+  
+  # Try common year/quarter formats first
+  candidates <- list(
+    try_fmt("%YQ%q"),
+    try_fmt("%Y-Q%q"),
+    try_fmt("%Y Q%q"),
+    try_fmt("Q%q %Y")
+  )
+  
+  # Try date-based formats
+  d_iso <- try_date("%Y-%m-%d")
+  d_num <- try_date("%Y%m%d")
+  d_any <- try_date()
+  
+  candidates <- c(
+    candidates,
+    list(ifelse(is.na(d_iso), NA, zoo::as.yearqtr(d_iso))),
+    list(ifelse(is.na(d_num), NA, zoo::as.yearqtr(d_num))),
+    list(ifelse(is.na(d_any), NA, zoo::as.yearqtr(d_any)))
+  )
+  
+  # Pick the candidate with the most non-NA matches
+  nn <- vapply(candidates, function(x) sum(!is.na(x)), integer(1))
+  best_cand <- candidates[[which.max(nn)]]
+  best_cand
+}
+
+# Build tibble with a clean .qtr column
+fq <- fq_tr %>%
+  tibble::as_tibble(rownames = ".stamp") %>%
+  dplyr::mutate(.qtr = to_yearqtr_robust(.stamp)) %>%
+  dplyr::select(-.stamp) %>%
+  dplyr::relocate(.qtr) %>%
+  dplyr::arrange(.qtr)
+
+# Sanity check: do we have a valid quarter index?
+if (all(is.na(fq$.qtr))) {
+  stop(
+    "Could not parse fred_qd rownames into quarters. First 5 rownames: ",
+    paste(head(rownames(fq_raw)), collapse = ", ")
+  )
+}
+
+# Variable universe and checks
+FQ_CODES <- sort(setdiff(names(fq), ".qtr"))
+
+# Shock menu (your four choices)
+SHOCK_CHOICES <- c("BAA10YM","TNWMVBSNNCBBDIx","CONSPIx","UMCSENTx")
+SHOCK_LABELS  <- c(
+  "BAA10YM (BAA − 10Y Treasury spread)",
+  "TNWMVBSNNCBBDIx (NFC net worth / disp. business income)",
+  "CONSPIx (nonrevolving consumer loans / personal income)",
+  "UMCSENTx (sentiment index)"
+)
+names(SHOCK_CHOICES) <- SHOCK_LABELS
+
+# Controls (omit any that equals Y)
+CONTROL_SET <- c("GDPC1","INDPRO","PCECTPI","FEDFUNDS")
+
+# ------------- optional: sanity-check that needed vars exist ---------------
+NEEDED <- unique(c(SHOCK_CHOICES, CONTROL_SET))
+missing_needed <- setdiff(NEEDED, FQ_CODES)
+if (length(missing_needed)) {
+  warning("The following required codes are missing in BVAR::fred_qd on this machine: ",
+          paste(missing_needed, collapse = ", "))
+}
+
+# --------------------------------- UI --------------------------------------
+ui <- fluidPage(
+  tags$head(tags$title("Atelier: Multi‑Shock Local Projections • ECON 413")),
+  titlePanel("Local Projections with Automatic FRED‑QD Transforms (BVAR)"),
+  fluidRow(
+    column(
+      4,
+      wellPanel(
+        selectInput("shock", "Shock variable:", choices = SHOCK_CHOICES),
+        selectInput("yvar",  "Endogenous variable (Y):", choices = FQ_CODES, selected = "INDPRO"),
+        numericInput("lags", "Number of lags p:", value = 4, min = 1, max = 12, step = 1),
+        numericInput("horizon", "IRF horizon H (quarters):", value = 40, min = 4, max = 60, step = 1),
+        checkboxInput("zscale", "Scale shock & Y to SD units", TRUE),
+        actionButton("go", "Estimate IRF", class = "btn-primary")
+      ),
+      helpText(HTML(
+        "<b>All variables were transformed before the Shiny session opened</b> ",
+        "using <code>BVAR::fred_transform()</code> (FRED‑QD appendix rules). ",
+        "Controls: GDPC1, INDPRO, PCECTPI, FEDFUNDS (omit if equal to Y). ",
+        "Estimation: Jord\u00E0 LPs, Newey–West SEs."
+      ))
+    ),
+    column(
+      8,
+      plotOutput("irfPlot", height = "480px"),
+      br(),
+      textOutput("sampleInfo"),
+      textOutput("specInfo")
+    )
+  )
+)
+
+# -------------------------------- Server -----------------------------------
+server <- function(input, output, session){
+  
+  merged_data <- eventReactive(input$go, {
+    yvar      <- input$yvar
+    shock_var <- input$shock
+    H_req <- input$horizon
+    p     <- input$lags
+    
+    # Check presence
+    validate(need(all(c(yvar, shock_var) %in% names(fq)), "Selected series not found in fred_qd."))
+    ctrls <- setdiff(CONTROL_SET, yvar)
+    validate(need(all(ctrls %in% names(fq)),
+                  paste0("Missing required controls in this fred_qd build: ",
+                         paste(setdiff(CONTROL_SET, names(fq)), collapse = ", "))))
+    
+    # Build model frame: create y & shock first, then select controls
+    df <- fq %>%
+      dplyr::mutate(
+        y     = .data[[yvar]],
+        shock = .data[[shock_var]]
+      ) %>%
+      dplyr::select(.qtr, y, shock, tidyselect::all_of(ctrls)) %>%
+      tidyr::drop_na()
+    
+    N <- nrow(df)
+    # Need at least p+2 obs for h=0 (one row after p lags)
+    validate(need(N > p + 1,
+                  paste0("Only N = ", N, " usable quarters after transforms & intersection; ",
+                         "with p = ", p, " you need at least ", p + 2, " for h = 0. ",
+                         "Reduce p, choose a different series pair, or widen the sample.")))
+    
+    # Optional z-scaling (only for y and shock); guard zero variance
+    scale_note <- NULL
+    if (isTRUE(input$zscale)) {
+      if (sd(df$y, na.rm = TRUE) > 0) df$y <- zscore(df$y) else scale_note <- c(scale_note, "Y not scaled (zero variance).")
+      if (sd(df$shock, na.rm = TRUE) > 0) df$shock <- zscore(df$shock) else scale_note <- c(scale_note, "Shock not scaled (zero variance).")
+      scale_note <- paste(scale_note, collapse = " ")
+    }
+    
+    # Effective horizon allowed by data
+    H_eff <- max(0, min(H_req, N - p - 1))
+    
+    list(
+      df = df, yvar = yvar, ctrls = ctrls, p = p,
+      H_req = H_req, H_eff = H_eff,
+      shock_label = names(SHOCK_CHOICES)[match(shock_var, SHOCK_CHOICES)],
+      scale_note  = scale_note
+    )
+  }, ignoreInit = TRUE)
+  
+  
+  irf_tbl <- reactive({
+    m <- merged_data()
+    d <- m$df
+    ctrl_mat <- as_tibble(d[, m$ctrls, drop = FALSE])
+    
+    lp_irf(
+      y = d$y,
+      x = d$shock,
+      ctrls = ctrl_mat,
+      H = m$H_eff,           # << use effective horizon
+      p = m$p
+    ) %>% as_tibble()
+  })
+  
+  output$irfPlot <- renderPlot({
+    req(irf_tbl())
+    m <- merged_data(); irf <- irf_tbl()
+    
+    ggplot(irf, aes(x = h)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+      geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.18, fill = "grey70") +
+      geom_line(aes(y = beta), linewidth = 1.2, color = "black") +
+      labs(
+        x = "Horizon (quarters)",
+        y = if (isTRUE(input$zscale)) "Response (SD units of Y)" else "Response (transformed units)",
+        title = paste0("LP IRF of ", m$yvar, " to ", m$shock_label,
+                       if (isTRUE(input$zscale)) " (1‑SD shock)" else "")
+      ) +
+      scale_x_continuous(breaks = seq(0, max(irf$h), by = 4), limits = c(0, max(irf$h))) +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(face = "bold"),
+            panel.grid.minor = element_blank())
+  })
+  
+  output$sampleInfo <- renderText({
+    m <- merged_data(); d <- m$df
+    rng <- paste(format(min(d$.qtr)), "to", format(max(d$.qtr)))
+    paste0("Sample after pre‑session FRED‑QD transforms & trimming: ", rng,
+           " • N = ", nrow(d), " quarters.")
+  })
+  
+  output$specInfo <- renderText({
+    m <- merged_data()
+    paste0(
+      "Controls (transformed, p‑lagged): ", paste(m$ctrls, collapse = ", "),
+      " • lags p = ", m$p,
+      " • requested H = ", m$H_req,
+      " • effective H = ", m$H_eff,
+      if (!is.null(m$scale_note) && nchar(m$scale_note) > 0) paste0(" • ", m$scale_note) else ""
+    )
+  })
+  
+}
+
+shinyApp(ui, server)
+
+#-----------------------------------TO DO---------------------------------------
+# 1. What does an increase in each of the four shock variables represent in words?
+#    e.g., "An increase in PCETPI means unexpected higher inflation"
+# 2. Four each of the four shocks available, form and test two hypotheses using 
+#    the impulse response functions as your evidence.
+#    e.g., "I expect from AD/AS that an unexpected positive shock to PCETPI will reduce
+#    GDPC1 because of lower aggregate demand at the higher price level. The impulse
+#    response of GDPC1 to PCETPI declines on impact, suggesting my hypothesis was correct".
